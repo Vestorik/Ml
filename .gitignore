@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.env
+
+
+rc_src/
+py_src/project/cifar10/data/
+py_src/project/rag_fst/data_storage/

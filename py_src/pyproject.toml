@@ -5,8 +5,32 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14.2"
 dependencies = [
-    "torch==2.10.0+cu130",
-    "torchvision==0.25.0+cu130",
+    "aiofiles>=25.1.0",
+    "concurrent-log-handler>=0.9.28",
+    "huggingface-hub>=1.4.1",
+    "langchain>=1.2.10",
+    "langchain-community>=0.4.1",
+    "langchain-text-splitters>=1.1.0",
+    "pdfplumber>=0.11.9",
+    "python-dotenv>=1.2.1",
+    "python-magic>=0.4.27",
+    "qdrant-client>=1.16.2",
+    "sentence-transformers>=5.2.2",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    "tqdm>=4.66.5",
 ]
+
+
 [tool.uv]
-index-url = "https://download.pytorch.org/whl/cu130"
+index-url = "https://pypi.org/simple"
+
+# ТОЛЬКО для torch/torchvision, не для других пакетов
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true  
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130" }]
+torchvision = [{ index = "pytorch-cu130" }]

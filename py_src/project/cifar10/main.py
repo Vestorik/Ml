@@ -18,10 +18,10 @@ INPUT_SIZE = 32 * 32  # входные данные тензор 3 по 32*32
 NUM_CLASSES = 10  # 10 классов
 NUM_EPOCH = 10  # 10 эпох ~ 75% точности далее рост замедляется
 LEARN_RATE = 0.001
-DEVICE = tr.device("cuda" if tr.cuda.is_available() else "cpu")
+DEVICE = tr.device('cuda' if tr.cuda.is_available() else 'cpu')
 LEARN = True  # Обучаем модель или пытаемся использовать предобученную
 
-
+print(DEVICE)
 # Определяем модель и переносим её на DEVICE (предположительно GPU)
 model = CNN(NUM_CLASSES, INPUT_SIZE)
 model = model.to(DEVICE)

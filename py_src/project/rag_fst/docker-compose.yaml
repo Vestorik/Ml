@@ -1,0 +1,25 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - ${QDRANT_STORAGE_DIR:-./data_storage/vector_storage}:/qdrant/storage # Основной API-порт
+    volumes:
+    # сервер:/контейнер
+      - ./data_storage/vector_storage:/qdrant/storage  # Сохранение данных
+    environment:
+      - QDRANT__SERVICE__PORT=${QDRANT_PORT:-6333}
+      - QDRANT__LOG_LEVEL=${QDRANT_LOG_LEVEL:-INFO}
+      - QDRANT__API_KEY=${QDRANT_API_KEY}
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  qdrant_storage:
+    driver: local
