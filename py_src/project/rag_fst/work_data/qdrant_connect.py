@@ -8,14 +8,12 @@
 - Управления состоянием коллекций
 
 Ключевые улучшения (необходимо реализовать):
-1. Добавлена автоматическая retry-логика при сетевых ошибках и таймаутах
-2. Реализован метод `find_similar_batch` для эффективного поиска по нескольким запрос-векторам
-3. Внедрён механизм чанкинга (chunking) при сохранении больших батчей эмбеддингов — 
+
+3. Внедрён механизм чанкинга (chunking) при сохранении больших батчей эмбеддингов —
    теперь можно безопасно работать с тысячами и миллионами векторов без риска OOM
 4. Поддержка фильтрации по payload через параметр `query_filter` в поиске
-5. Исправлены критические проблемы: замена `uuid7()` на `uuid4()`, переход с `query_points` на `search`
-6. Добавлен метод `collection_exists` для проверки существования коллекции перед операциями
-7. Оптимизация производительности: использование `.numpy().tolist()` вместо медленного `.tolist()`
+
+
 
 Архитектура модуля обеспечивает:
 - Высокую надёжность за счёт повторных попыток и валидации
@@ -25,12 +23,18 @@
 Используется асинхронный движок QdrantClient для неблокирующей работы.
 Автоматически обрабатывает перемещение тензоров с GPU на CPU и сериализацию в JSON.
 """
-
-
+from typing import Sequence
 import uuid
 import logging
 from pathlib import Path
-from qdrant_client import QdrantClient
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+)
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import (
     VectorParams,
     Distance,
@@ -42,19 +46,21 @@ from qdrant_client.models import (
     ScalarQuantizationConfig,
     ScalarType,
 )
+from .vectorize import vectorize_text
+from qdrant_client.conversions import common_types as types
 import torch as tr
 import numpy as np
 from .work_data_config import (
     QDRANT_URL,
     QDRANT_KEY,
 )
+from .models import PlayloadPoint
 
 logger = logging.getLogger(__name__)
 
 
 class QdrantConnect:
-    """
-    Асинхронный клиент для взаимодействия с векторной базой данных Qdrant.
+    """Асинхронный клиент для взаимодействия с векторной базой данных Qdrant.
 
     Обеспечивает удобные методы для:
     - Создания и настройки коллекций
@@ -97,35 +103,34 @@ class QdrantConnect:
             )
         ),
     }
-    """
-    Карта параметров по умолчанию для создания коллекций.
+    """ Карта параметров по умолчанию для создания коллекций.
 
-    Содержит оптимальные значения для большинства задач:
-    
-    - vector_params: 
-        - size=384 — стандартный размер у miniLM и подобных моделей
-        - distance=COSINE — косинусная метрика, наиболее подходящая для эмбеддингов
-    
-    - optimizers_params:
-        - deleted_threshold=0.2 — удалять сегменты, если более 20% векторов удалено
-        - vacuum_min_vector_number=1000 — не запускать очистку при малом количестве векторов
-        - indexing_threshold=20000 — начинать индексацию после 20к векторов
-        - flush_interval_sec=10 — регулярная запись на диск
-    
-    - hnsw_params:
-        - m=48 — максимальное количество связей между вершинами
-        - ef_construct=200 — качество построения графа
-        - full_scan_threshold=10000 — переключение на полный поиск при малых объёмах
-    
-    - collection_params:
-        - on_disk_payload=False — payload хранится в RAM для быстрого доступа
-    
-    - quantization_params:
-        - INT8 + quantile=0.99 — сжатие векторов с минимальной потерей точности
-        - always_ram=True — квантованные векторы всегда в оперативной памяти
+        Содержит оптимальные значения для большинства задач:
+        
+        - vector_params: 
+            - size=384 — стандартный размер у miniLM и подобных моделей
+            - distance=COSINE — косинусная метрика, наиболее подходящая для эмбеддингов
+        
+        - optimizers_params:
+            - deleted_threshold=0.2 — удалять сегменты, если более 20% векторов удалено
+            - vacuum_min_vector_number=1000 — не запускать очистку при малом количестве векторов
+            - indexing_threshold=20000 — начинать индексацию после 20к векторов
+            - flush_interval_sec=10 — регулярная запись на диск
+        
+        - hnsw_params:
+            - m=48 — максимальное количество связей между вершинами
+            - ef_construct=200 — качество построения графа
+            - full_scan_threshold=10000 — переключение на полный поиск при малых объёмах
+        
+        - collection_params:
+            - on_disk_payload=False — payload хранится в RAM для быстрого доступа
+        
+        - quantization_params:
+            - INT8 + quantile=0.99 — сжатие векторов с минимальной потерей точности
+            - always_ram=True — квантованные векторы всегда в оперативной памяти
     """
 
-    def __init__(self, url: str, api_key: str):
+    def __init__(self, url: str | Path, api_key: str):
         """
         Инициализирует клиент Qdrant.
 
@@ -134,7 +139,7 @@ class QdrantConnect:
         :param api_key: Ключ API для аутентификации.
         :type api_key: str
         """
-        self.client = QdrantClient(url=url, api_key=api_key, async_engine=True)
+        self.client = AsyncQdrantClient(url=str(url), api_key=api_key)
 
     @classmethod
     def _prepare_config_param(
@@ -175,9 +180,9 @@ class QdrantConnect:
 
         # Настройка параметров векторов
         # Размер берётся из входного параметра, метрика — из переданного объекта или по умолчанию
-        vec_cfg = (
+        vec_cfg: VectorParams = (
             vector_params or cls.__DEFAULT_VECTOR_COLLECTION_CONFIG_MAP["vector_params"]
-        )
+        )  # ty:ignore[invalid-assignment] // в любом случае VectorParams если атрибуты класса не изменены
         kwargs["vectors_config"] = VectorParams(
             size=vector_size, distance=vec_cfg.distance
         )
@@ -317,14 +322,161 @@ class QdrantConnect:
             logger.warning("Ошибка при обновлении коллекции %s: %s", collection_name, e)
             raise
 
+    def _transform_query_to_valid_array(self, query: str | tr.Tensor | np.ndarray) -> list[float]:
+        
+        if isinstance(query, str):
+            embedd = vectorize_text(query)
+            
+            # Находим вектор средних значений
+            query = embedd.mean(dim=0)
+            
+        #  Преобразуем Tensor в numpy масив
+        if isinstance(query, tr.Tensor):
+            if query.requires_grad:
+                query = query.detach()
+            query = query.cpu().numpy()
+
+
+        # Обработка NumPy массива
+        if isinstance(query, np.ndarray):
+            if query.ndim == 1:
+                vector = query
+            elif query.ndim == 2:
+                # Много векторов — усредняем по первому измерению
+                vector = query.mean(axis=0)
+            else:
+                logger.warning("Ожидался 1D или 2D массив, получено %s D", {query.ndim})
+                raise ValueError(f"Ожидался 1D или 2D массив, получено {query.ndim}D")
+        
+        norm = np.linalg.norm(vector)
+        if norm == 0:
+            logger.warning("Нулевой вектор — невозможно нормализовать")
+            raise ValueError("Нулевой вектор — невозможно нормализовать")
+
+        # Нормализуем вектор 
+        vector = vector / norm
+        
+        return vector.tolist()
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(
+            (ConnectionError, TimeoutError, UnexpectedResponse)
+        ),
+        reraise=True,
+    )
+    async def find_similar(
+        self,
+        collection_name: str,
+        query: str | tr.Tensor | np.ndarray,
+        limit: int = 5,
+        query_filter: types.Filter | None = None,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        score_threshold: float | None = None,
+    ) -> list[types.ScoredPoint] | None:
+        """
+        Найти похожие точки по текстовому запросу.
+
+        Args:
+            client: Асинхронный клиент Qdrant
+            collection_name: Имя коллекции
+            query_text: Текст запроса (будет преобразован в вектор) или вектор
+            limit: Количество возвращаемых результатов
+            query_filter: Фильтр для ограничения поиска
+            with_payload: Включить payload в результат
+            with_vectors: Включить векторы в результат
+            score_threshold: Минимальный порог схожести
+
+        Returns:
+            Список найденных точек с оценками (ScoredPoint)
+        """
+
+        embedding = self._transform_query_to_valid_array(query)
+        
+        response = await self.client.query_points(
+            collection_name=collection_name,
+            query=embedding,
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=with_payload,
+            with_vectors=with_vectors,
+            score_threshold=score_threshold,
+        )
+        return response.points
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(
+            (ConnectionError, TimeoutError, UnexpectedResponse)
+        ),
+        reraise=True,
+    )
+    async def find_similar_batch(
+        self,
+        collection_name: str,
+        queries: Sequence[str] | Sequence[tr.Tensor] | Sequence[np.ndarray],
+        limit: int = 5,
+        query_filter: types.Filter | None = None,
+        with_payload: bool = True,
+        with_vectors: bool = False,
+        score_threshold: float | None= None,
+    ) ->  list[list[types.ScoredPoint]]:
+        """
+        Пакетный поиск похожих точек по нескольким текстовым запросам.
+
+        Args:
+            client: Асинхронный клиент Qdrant
+            collection_name: Имя коллекции
+            queries: Список текстовых запросов
+            limit: Количество возвращаемых результатов на каждый запрос
+            query_filter: Фильтр для всех запросов
+            with_payload: Включить payload в результат
+            with_vectors: Включить векторы в результат
+            score_threshold: Минимальный порог схожести
+
+        Returns:
+            Список списков найденных точек (по одному списку на каждый запрос)
+        """
+        requests = [
+            types.QueryRequest(
+                query=self._transform_query_to_valid_array(this_query),
+                limit=limit,
+                filter=query_filter,  
+                with_payload=with_payload,
+                with_vector=with_vectors,
+                score_threshold=score_threshold,
+            )
+            for this_query in queries
+        ]
+
+        responses = await self.client.query_batch_points(
+            collection_name=collection_name,
+            requests=requests,
+        )
+
+        # Извлекаем `.points` из каждого ответа
+        return [response.points for response in responses]
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(
+            (ConnectionError, TimeoutError, UnexpectedResponse)
+        ),
+        reraise=True,
+    )
     async def save_embeddings(
         self,
         embeddings: tr.Tensor | np.ndarray,
         collection_name: str,
-        payload_list: list[dict] | None = None,
+        payload_list: list[dict] | None  = None,
+        chunk_size: int = 100,
     ) -> bool:
         """
-        Сохраняет батч эмбеддингов в указанную коллекцию Qdrant.
+        Сохраняет батч эмбеддингов в указанную коллекцию Qdrant с чанкингом и retry-логикой.
 
         Принимает как тензоры PyTorch (на GPU/CPU), так и массивы NumPy.
         Автоматически обрабатывает тип данных и перемещает с GPU на CPU.
@@ -335,6 +487,8 @@ class QdrantConnect:
         :type collection_name: str
         :param payload_list: Список словарей с метаданными для каждого вектора. Если None — создаются пустые.
         :type payload_list: list[dict] | None
+        :param chunk_size: Размер чанка для вставки, по умолчанию 100.
+        :type chunk_size: int
 
         :return: True при успешной вставке всех векторов.
         :rtype: bool
@@ -344,8 +498,10 @@ class QdrantConnect:
 
         .. note::
             - Использует `upsert` с `wait=True` — гарантирует запись до возврата.
-            - Генерирует уникальные ID с помощью `uuid7()` (временные UUID).
+            - Генерирует уникальные ID с помощью `uuid4()`.
             - Каждый вектор сохраняется как PointStruct с id, vector, payload.
+            - Применяется чанкинг для больших батчей.
+            - Реализована retry-логика при сетевых ошибках и таймаутах.
         """
         # Преобразование PyTorch тензора в NumPy массив
         if isinstance(embeddings, tr.Tensor):
@@ -364,113 +520,36 @@ class QdrantConnect:
                 "Количество элементов в payload_list должно равняться количеству векторов"
             )
 
-        # Подготовка точек для вставки
-        # Используем int(uuid.uuid4()) как уникальный числовой ID
-        points = [
-            PointStruct(
-                id=str(uuid.uuid4()),
-                vector=embedding.tolist(),  # преобразуем в список чисел
-                payload=payload,
-            )
-            for embedding, payload in zip(embeddings, payload_list)
-        ]
+        # Разделение на чанки
+        for i in range(0, num_vectors, chunk_size):
+            chunk_embeddings = embeddings[i : i + chunk_size]
+            chunk_payloads = payload_list[i : i + chunk_size]
 
-        try:
-            # Выполнение асинхронной вставки
-            await self.client.upsert(
-                collection_name=collection_name, wait=True, points=points
-            )
-            logger.info(
-                "Сохранено %d векторов в коллекцию %s", num_vectors, collection_name
-            )
-        except Exception as e:
-            logger.error(
-                "Ошибка при сохранении векторов в коллекцию %s: %s", collection_name, e
-            )
-            raise
-
-    async def find_similar(
-        self,
-        embedding: tr.Tensor | np.ndarray,
-        collection_name: str,
-        limit: int = 5,
-    ) -> list:
-        """
-        Выполняет поиск ближайших похожих векторов в указанной коллекции.
-
-        Использует косинусное сходство (или другую метрику, заданную при создании коллекции).
-
-        :param embedding: Запрос-вектор формы (D,) или (1, D). Может быть torch.Tensor или np.ndarray.
-        :type embedding: torch.Tensor | np.ndarray
-        :param collection_name: Имя коллекции, в которой искать.
-        :type collection_name: str
-        :param limit: Максимальное количество возвращаемых результатов. По умолчанию — 5.
-        :type limit: int
-
-        :return: Список словарей с полями:
-                - 'id': идентификатор найденного вектора
-                - 'score': оценка схожести (чем выше, тем ближе)
-                - 'payload': метаданные, привязанные к вектору
-        :rtype: list[dict]
-
-        :raises TypeError: Если embedding не является torch.Tensor или np.ndarray.
-        :raises ValueError: Если форма вектора некорректна.
-        :raises Exception: При ошибках соединения или в Qdrant.
-
-        .. note::
-            - Тензоры автоматически переводятся на CPU и в NumPy.
-            - Поддерживаются одномерные (D,) и двумерные (1, D) формы.
-            - Используется `query_points` — современный метод поиска в Qdrant.
-            - Возвращает payload, но не векторы (with_vectors=False).
-        """
-        # Шаг 1: Преобразование в NumPy массив на CPU
-        if isinstance(embedding, tr.Tensor):
-            if embedding.requires_grad:
-                embedding = embedding.detach()  # убираем градиенты
-            embedding = embedding.cpu().numpy()  # перемещаем на CPU
-
-        if not isinstance(embedding, np.ndarray):
-            raise TypeError("Embedding должен быть torch.Tensor или np.ndarray")
-
-        # Шаг 2: Нормализация формы в (1, D)
-        if embedding.ndim == 1:
-            # Преобразуем одномерный вектор в двумерный
-            embedding = embedding.reshape(1, -1)
-        elif embedding.ndim == 2 and embedding.shape[0] == 1:
-            # Уже в нужной форме — ничего не делаем
-            pass
-        else:
-            raise ValueError(
-                f"Ожидался 1D вектор или 2D массив формы (1, D), получено: {embedding.shape}"
-            )
-
-        # Шаг 3: Подготовка вектора для запроса
-        query_vector = embedding[0].tolist()  # преобразуем в list[float]
-
-        try:
-            # Выполнение поиска
-            search_result = await self.client.query_points(
-                collection_name=collection_name,
-                query_vector=query_vector,
-                limit=limit,
-                with_payload=True,
-                with_vectors=False,
-            )
-
-            # Формирование результата
-            matches = [
-                {"id": hit.id, "score": hit.score, "payload": hit.payload}
-                for hit in search_result
+            points = [
+                PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=embedding.tolist(),  # преобразуем в список чисел
+                    payload=payload,
+                )
+                for embedding, payload in zip(chunk_embeddings, chunk_payloads)
             ]
 
-            logger.info(
-                "Найдено %d совпадений в коллекции %s", len(matches), collection_name
-            )
-            return matches
-
-        except Exception as e:
-            logger.error("Ошибка при поиске в коллекции %s: %s", collection_name, e)
-            raise
+            try:
+                # Выполнение асинхронной вставки
+                await self.client.upsert(
+                    collection_name=collection_name, wait=True, points=points
+                )
+                logger.info(
+                    "Сохранено %d векторов в коллекцию %s", len(points), collection_name
+                )
+            except Exception as e:
+                logger.error(
+                    "Ошибка при сохранении векторов в коллекцию %s: %s",
+                    collection_name,
+                    e,
+                )
+                raise
+        return True
 
     async def delete_collection(
         self,
@@ -496,7 +575,7 @@ class QdrantConnect:
             logger.error("Ошибка при удалении коллекции %s: %s", collection_name, e)
             raise
 
-    async def get_all_colections(self) -> list:
+    async def get_all_collections(self) -> list:
         """
         Получает список имён всех коллекций, доступных в экземпляре Qdrant.
 
@@ -519,6 +598,27 @@ class QdrantConnect:
         except Exception as e:
             logger.error("Ошибка при получении списка коллекций: %s", e)
             raise
+
+    async def collection_exists(self, collection_name: str) -> bool:
+        """
+        Проверяет, существует ли коллекция в базе данных Qdrant.
+
+        :param collection_name: Имя коллекции для проверки.
+        :type collection_name: str
+        :return: True, если коллекция существует; иначе False.
+        :rtype: bool
+
+        .. example::
+            >>> client = get_qdrant_client()
+            >>> exists = await client.collection_exists("my_docs")
+            >>> if not exists:
+            ...     await client.create_collection("my_docs", vector_size=384)
+        """
+        try:
+            await self.client.get_collection(collection_name)
+            return True
+        except Exception:
+            return False
 
 
 def get_qdrant_client(

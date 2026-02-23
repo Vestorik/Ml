@@ -4,7 +4,7 @@ services:
     container_name: qdrant
     restart: unless-stopped
     ports:
-      - ${QDRANT_STORAGE_DIR:-./data_storage/vector_storage}:/qdrant/storage # Основной API-порт
+      - ${QDRANT_PORT:-6333}:6333 # Основной API-порт
     volumes:
     # сервер:/контейнер
       - ./data_storage/vector_storage:/qdrant/storage  # Сохранение данных

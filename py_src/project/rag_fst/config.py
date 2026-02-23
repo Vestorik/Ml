@@ -1,3 +1,4 @@
+from sympy.core.cache import CACHE
 import logging
 from pathlib import Path
 from concurrent_log_handler import ConcurrentRotatingFileHandler
@@ -13,13 +14,16 @@ BASE_PATH: Path = Path(__file__).resolve().parent
 DATA_STORAGE_PATH = BASE_PATH / "data_storage"
 DATA_STORAGE_PATH.mkdir(parents=True, exist_ok=True)
 
+CACHE_PATH = DATA_STORAGE_PATH / "cache"
+CACHE_PATH.mkdir(parents=True, exist_ok=True)
+
 LOG_DIR = BASE_PATH / "logging"
 LOG_DIR.mkdir(exist_ok=True)
 log_path = LOG_DIR /"app.log"
 
 
 #  Модели
-DEVICE: str = tr.device("cuda" if tr.cuda.is_available() else "cpu")
+DEVICE = tr.device("cuda" if tr.cuda.is_available() else "cpu")
 SENTECE_TRANSFORM_MODEL_STR: str = getenv('SENTECE_TRANSFORM_MODEL_NAME', 'sberbank-ai/sbert_large_nlu_ru')
 
 
