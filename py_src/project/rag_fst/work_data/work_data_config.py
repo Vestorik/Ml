@@ -6,6 +6,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 QDRANT_URL: str = VECTOR_BD_URL
 QDRANT_KEY: str = VECTOR_BD_API_KEY
 
+BASE_COLLECTION_NAME: str = 'BASE_COLLECTION'
+
 # Трансформеры текста
 SENTECE_TRANSFORM_MODEL = SentenceTransformer(SENTECE_TRANSFORM_MODEL_STR)
                                             #   cache_folder=str(CACHE_PATH / 'models' / SENTECE_TRANSFORM_MODEL_STR))

@@ -23,7 +23,8 @@
 Используется асинхронный движок QdrantClient для неблокирующей работы.
 Автоматически обрабатывает перемещение тензоров с GPU на CPU и сериализацию в JSON.
 """
-from typing import Sequence
+from typing import Sequence, Callable
+from functools import wraps
 import uuid
 import logging
 from pathlib import Path
@@ -44,7 +45,7 @@ from qdrant_client.models import (
     HnswConfigDiff,
     CollectionParamsDiff,
     ScalarQuantizationConfig,
-    ScalarType,
+    ScalarType, Filter, FieldCondition, MatchValue,
 )
 from .vectorize import vectorize_text
 from qdrant_client.conversions import common_types as types
@@ -53,10 +54,15 @@ import numpy as np
 from .work_data_config import (
     QDRANT_URL,
     QDRANT_KEY,
+    BASE_COLLECTION_NAME
 )
 from .models import PlayloadPoint
 
 logger = logging.getLogger(__name__)
+
+
+
+        
 
 
 class QdrantConnect:
@@ -141,7 +147,7 @@ class QdrantConnect:
         """
         self.client = AsyncQdrantClient(url=str(url), api_key=api_key)
 
-    @classmethod
+    @classmethod  # _prepare_config_param
     def _prepare_config_param(
         cls,
         vector_size: int,
@@ -202,7 +208,79 @@ class QdrantConnect:
             )
 
         return kwargs
+    
+    @classmethod  # _transform_query_to_valid_array
+    def _transform_query_to_valid_array(cls, query: str | tr.Tensor | np.ndarray, normalize: bool = True) -> list[float]:
+        
+        if isinstance(query, str):
+            embedd = vectorize_text(query)
+            
+            # Находим вектор средних значений
+            query = embedd.mean(dim=0)
+            
+        #  Преобразуем Tensor в numpy масив
+        if isinstance(query, tr.Tensor):
+            if query.requires_grad:
+                query = query.detach()
+            query = query.cpu().numpy()
 
+        # Обработка NumPy массива
+        if isinstance(query, np.ndarray):
+            if query.ndim == 1:
+                vector = query
+            elif query.ndim == 2:
+                # Много векторов — усредняем по первому измерению
+                vector = query.mean(axis=0)
+            else:
+                logger.warning("Ожидался 1D или 2D массив, получено %s D", {query.ndim})
+                raise ValueError(f"Ожидался 1D или 2D массив, получено {query.ndim}D")
+            
+        if normalize:
+            norm = np.linalg.norm(vector)
+            if norm == 0:
+                logger.warning("Нулевой вектор — невозможно нормализовать")
+                raise ValueError("Нулевой вектор — невозможно нормализовать")
+
+            # Нормализуем вектор 
+            vector = vector / norm
+
+            
+        return vector.tolist()
+
+    @retry( # _check_or_create_base_collection
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(
+            (ConnectionError, TimeoutError, UnexpectedResponse)
+        ),
+        reraise=True,
+    )
+    async def _check_or_create_base_collection(self, vector_size) -> bool:
+        """
+        Проверяет наличие коллекции base_all_collection.
+        Если её нет — создаёт и заполняет всеми существующими коллекциями.
+        """
+        BASE_COLLECTION = BASE_COLLECTION_NAME
+
+        # Проверяем, существует ли base_all_collection
+        if not await self.collection_exists(BASE_COLLECTION):
+            await self.create_collection(
+                collection_name=BASE_COLLECTION,
+                vector_size=vector_size,
+                vector_params=VectorParams(size=vector_size, distance=Distance.COSINE),
+            )
+            logger.info("Создана мета-коллекция %s", BASE_COLLECTION)
+            
+        return True
+        
+    @retry( # create_collection
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(
+            (ConnectionError, TimeoutError, UnexpectedResponse)
+        ),
+        reraise=True,
+    )
     async def create_collection(
         self,
         collection_name: str,
@@ -243,6 +321,12 @@ class QdrantConnect:
             Использует `_prepare_config_param` для формирования полной конфигурации.
             Логгирует успешное создание или ошибку.
         """
+        # Обрабатываем случай если коллекция с таким именем существует 
+        if await self.collection_exists(collection_name):
+            logger.info("Коллекция %s уже существует", collection_name)
+            return False
+        
+        #  Подготавливаем параметры
         other_param: dict = self._prepare_config_param(
             vector_size,
             vector_params,
@@ -251,7 +335,16 @@ class QdrantConnect:
             hnsw_params,
             collection_params,
         )
+        
         try:
+            #  Сохраняем эмбеддинг названия коллекции в базовую коллекцию для последующего поиска по коллекциям
+            vector_of_name_collection, playload = vectorize_text(text=collection_name, text_source="For Base_collection")
+            vector_size_of_name_collection = vector_of_name_collection.size()[0]
+            await self._check_or_create_base_collection(vector_size_of_name_collection)
+            await self.save_embeddings(vector_of_name_collection, BASE_COLLECTION_NAME,  playload)
+            
+            
+            #  Создаём коллекцию
             await self.client.create_collection(
                 collection_name=collection_name, **other_param
             )
@@ -322,41 +415,6 @@ class QdrantConnect:
             logger.warning("Ошибка при обновлении коллекции %s: %s", collection_name, e)
             raise
 
-    def _transform_query_to_valid_array(self, query: str | tr.Tensor | np.ndarray) -> list[float]:
-        
-        if isinstance(query, str):
-            embedd = vectorize_text(query)
-            
-            # Находим вектор средних значений
-            query = embedd.mean(dim=0)
-            
-        #  Преобразуем Tensor в numpy масив
-        if isinstance(query, tr.Tensor):
-            if query.requires_grad:
-                query = query.detach()
-            query = query.cpu().numpy()
-
-
-        # Обработка NumPy массива
-        if isinstance(query, np.ndarray):
-            if query.ndim == 1:
-                vector = query
-            elif query.ndim == 2:
-                # Много векторов — усредняем по первому измерению
-                vector = query.mean(axis=0)
-            else:
-                logger.warning("Ожидался 1D или 2D массив, получено %s D", {query.ndim})
-                raise ValueError(f"Ожидался 1D или 2D массив, получено {query.ndim}D")
-        
-        norm = np.linalg.norm(vector)
-        if norm == 0:
-            logger.warning("Нулевой вектор — невозможно нормализовать")
-            raise ValueError("Нулевой вектор — невозможно нормализовать")
-
-        # Нормализуем вектор 
-        vector = vector / norm
-        
-        return vector.tolist()
 
     @retry(
         stop=stop_after_attempt(3),
@@ -503,17 +561,26 @@ class QdrantConnect:
             - Применяется чанкинг для больших батчей.
             - Реализована retry-логика при сетевых ошибках и таймаутах.
         """
-        # Преобразование PyTorch тензора в NumPy массив
+
+        # Преобразуем в numpy (N, D)
         if isinstance(embeddings, tr.Tensor):
-            # Убираем граф вычислений и перемещаем на CPU
-            embeddings = embeddings.detach().cpu().numpy()
+            if embeddings.requires_grad:
+                embeddings = embeddings.detach()
+            embeddings = embeddings.cpu().numpy()
 
-        # Валидация входных данных
-        if not isinstance(embeddings, np.ndarray) or embeddings.ndim != 2:
-            raise ValueError("Embeddings должны быть двумерным массивом формы (N, D)")
+        if isinstance(embeddings, np.ndarray):
+            if embeddings.ndim == 1:
+                # Случай: один вектор (D,) → делаем (1, D)
+                embeddings = embeddings[np.newaxis, :]  # (1, D)
+            elif embeddings.ndim == 2:
+                pass  # уже (N, D)
+            else:
+                raise ValueError(f"Ожидался 1D или 2D массив, получено {embeddings.ndim}D")
+        else:
+            raise TypeError(f"Ожидался Tensor или ndarray, получен {type(embeddings)}")
 
-        num_vectors = embeddings.shape[0]
-        payload_list = payload_list or [{} for _ in range(num_vectors)]
+        num_vectors = len(embeddings)
+        payload_list: list[dict] = payload_list or [{} for _ in range(num_vectors)]
 
         if len(payload_list) != num_vectors:
             raise ValueError(
@@ -528,7 +595,7 @@ class QdrantConnect:
             points = [
                 PointStruct(
                     id=str(uuid.uuid4()),
-                    vector=embedding.tolist(),  # преобразуем в список чисел
+                    vector=embedding,  # преобразуем в список чисел
                     payload=payload,
                 )
                 for embedding, payload in zip(chunk_embeddings, chunk_payloads)
@@ -557,20 +624,69 @@ class QdrantConnect:
     ) -> None:
         """
         Удаляет коллекцию и все её данные из базы Qdrant.
-
-        Операция необратима. Все векторы и метаданные будут потеряны.
+        Также удаляет запись о коллекции из мета-коллекции `BASE_COLLECTION_NAME`.
 
         :param collection_name: Имя коллекции, которую нужно удалить.
         :type collection_name: str
 
-        :raises Exception: Если коллекция не существует или произошла ошибка сети.
-
-        .. warning::
-            Убедитесь, что коллекция больше не нужна. Восстановление невозможно.
+        :raises Exception: Если произошла ошибка сети или коллекция не существует.
         """
+
+
         try:
+            # 1. Удаляем саму коллекцию
             await self.client.delete_collection(collection_name=collection_name)
             logger.info("Коллекция %s успешно удалена", collection_name)
+
+            # 2. Удаляем запись из мета-коллекции (если она существует)
+            base_collection = BASE_COLLECTION_NAME
+
+            if not await self.collection_exists(base_collection):
+                logger.debug("Мета-коллекция %s не существует, пропускаем", base_collection)
+                return
+
+            # Фильтр: ищем точку, где text == collection_name и source == "For Base_collection"
+            query_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="text",
+                        match=MatchValue(value=collection_name)
+                    ),
+                    FieldCondition(
+                        key="source",
+                        match=MatchValue(value="For Base_collection")
+                    ),
+                ]
+            )
+
+            # Ищем точки
+            search_result = await self.client.scroll(
+                collection_name=base_collection,
+                scroll_filter=query_filter,
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+            points = search_result[0]  # [points, next_page_offset]
+
+            if not points:
+                logger.debug("Запись о коллекции %s не найдена в %s", collection_name, base_collection)
+                return
+
+            point_ids = [point.id for point in points]
+
+            # Удаляем найденные точки
+            await self.client.delete(
+                collection_name=base_collection,
+                points_selector=point_ids,
+            )
+
+            logger.info(
+                "Удалена запись о коллекции %s из мета-коллекции %s (point IDs: %s)",
+                collection_name, base_collection, point_ids
+            )
+
         except Exception as e:
             logger.error("Ошибка при удалении коллекции %s: %s", collection_name, e)
             raise
